@@ -205,7 +205,7 @@ With the `app` cargo feature (`cargo install --features app`, it is not part of 
 | -------- | ------------------------------------- | -------------------------------------------------- |
 | macOS    | `dmg` (default), `app`                | macOS                                              |
 | Windows  | `nsis` (default): an `.exe` installer | Windows, or any host with `makensis` on the `PATH` |
-| Linux    | `flatpak` (default)                   | Linux with `flatpak` and `flatpak-builder`         |
+| Linux    | `flatpak` (default)                   | Linux with `flatpak`                               |
 
 Describe the application in a TOML file.
 If a package in the environment defines a [menuinst](https://conda.github.io/menuinst/) shortcut (`Menu/*.json`), like `napari` or `spyder`, the application can be based on it.
@@ -277,14 +277,14 @@ On Windows, the launcher gets the application's icon (an `.ico`, or one created 
 The launcher, the installer and the uninstaller are signed if `certificate-thumbprint` (with `signtool`, only on Windows) or `sign-command` (on any platform, e.g. with `osslsigncode` or a cloud signing service) is set.
 The sign command is split on spaces, use a script for commands with spaces in paths.
 
-On Linux, `flatpak-builder` unpacks the environment into the Flatpak with `pixi-unpack`, as Flatpaks are always installed at the same path.
+On Linux, `pixi-unpack` unpacks the environment into the Flatpak in the Flatpak build sandbox, as Flatpaks are always installed at the same path.
 The Flatpak runs on the [Freedesktop runtime](https://flathub.org/apps/org.freedesktop.Platform), which users install along with the application.
 For the build, `pixi-pack` adds [Flathub](https://flathub.org) as a remote of the user's Flatpak installation if missing, and installs the runtime from it.
 The sandbox permissions (`finish-args`) let the application open windows, use the GPU and the network, and read and write files in the home directory, as conda GUI toolkits often don't use the file chooser portal.
 The identifier becomes the Flatpak application id, with `-` replaced by `_` in all but its last part.
 Users install the `.flatpak` by opening it in their software center, or with `flatpak install --user app.flatpak`.
 Flatpak is preinstalled on e.g. Fedora and Linux Mint, other distributions [need to install it](https://flathub.org/setup) once.
-Building needs about twice the size of the unpacked environment as free space in the temporary directory (`TMPDIR`), plus the packages unless `download-packages` is set.
+Building needs the size of the unpacked environment plus its compressed copy as free space in the temporary directory (`TMPDIR`), plus the packages unless `download-packages` is set.
 On GitHub-hosted runners, large environments need [more free space](https://github.com/actions/runner-images/issues/2840).
 
 `pixi-launcher` and `pixi-unpack` are downloaded from the pixi-pack release, use `--pixi-launcher-source` and `--pixi-unpack-source` to provide different ones.

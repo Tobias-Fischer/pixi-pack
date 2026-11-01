@@ -1,4 +1,4 @@
-//! Creating a Flatpak bundle (`.flatpak`) with `flatpak-builder`.
+//! Creating a Flatpak bundle (`.flatpak`) with the `flatpak build-*` commands.
 //!
 //! Flatpak applications always live at `/app` inside the sandbox, so unlike the other formats the
 //! environment is unpacked at build time, by running `pixi-unpack` inside the build sandbox. The
@@ -12,7 +12,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rattler_conda_types::Platform;
 use serde::Deserialize;
-use serde_json::json;
 
 use super::App;
 use crate::{REMOTE_PACKAGES_PATH, menu_placeholders, replace_placeholders};
@@ -77,17 +76,18 @@ pub(super) fn check_host() -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("Flatpak bundles can only be created on Linux");
     }
-    for program in ["flatpak", "flatpak-builder"] {
-        if !super::which(program) {
-            bail!(
-                "creating Flatpak bundles requires `{program}` on the PATH, e.g. from `apt install flatpak flatpak-builder`"
-            );
-        }
+    if !super::which("flatpak") {
+        bail!(
+            "creating Flatpak bundles requires `flatpak` on the PATH, e.g. from `apt install flatpak`"
+        );
     }
     Ok(())
 }
 
-/// Bundle the pack in `pack_dir` as a Flatpak in `out_dir`.
+/// Bundle the pack in `pack_dir` as a Flatpak in `out_dir`. The pack is moved into the build.
+///
+/// This uses the `flatpak build-*` commands rather than `flatpak-builder`, as `flatpak-builder`
+/// always commits the build to its cache, another uncompressed copy of the environment.
 pub(super) fn create(
     app: &App,
     config: &AppFlatpakConfig,
@@ -101,62 +101,7 @@ pub(super) fn create(
     let id = flatpak_id(&app.identifier)?;
     let command_name = super::executable_name(&app.name, Platform::Linux64);
 
-    let files = staging.join("flatpak-files");
-    std::fs::create_dir_all(&files)?;
-    std::fs::write(files.join("pixi-unpack"), pixi_unpack)?;
-    std::fs::write(files.join("launch.sh"), launch_script(&app.command))?;
-    std::fs::write(
-        files.join("app.desktop"),
-        desktop_entry(app, &id, &command_name, app.icon_png().is_some()),
-    )?;
-
-    let mut build_commands = vec![
-        "chmod +x pixi-unpack".to_string(),
-        // Unpacking extracts the packages next to the pack, and /app is a separate mount. Moving
-        // the pack there lets the environment hardlink the extracted files instead of copying.
-        "mv pack /app/.pack".to_string(),
-        "./pixi-unpack --output-directory /app --env-name env /app/.pack".to_string(),
-        "rm -rf /app/.pack".to_string(),
-        format!("install -Dm755 launch.sh /app/bin/{command_name}"),
-        format!("install -Dm644 app.desktop /app/share/applications/{id}.desktop"),
-    ];
-    if let Some(icon) = app.icon_png() {
-        let size = prepare_icon(icon, &files.join("icon.png"))?;
-        build_commands.push(format!(
-            "install -Dm644 icon.png /app/share/icons/hicolor/{size}x{size}/apps/{id}.png"
-        ));
-    }
-
-    let mut build_options = json!({ "strip": false, "no-debuginfo": true });
-    if pack_dir.join(REMOTE_PACKAGES_PATH).exists() {
-        build_options["build-args"] = json!(["--share=network"]);
-    }
-
-    let manifest = json!({
-        "id": id,
-        "runtime": config.runtime,
-        "runtime-version": config.runtime_version,
-        // Nothing is compiled, the runtime has everything the build commands need.
-        "sdk": config.runtime,
-        "command": command_name,
-        "finish-args": config.finish_args,
-        "modules": [{
-            "name": "environment",
-            "buildsystem": "simple",
-            // Stripping or splitting off debug info would modify the conda packages' binaries.
-            // Packages left out of the pack are downloaded while building.
-            "build-options": build_options,
-            "build-commands": build_commands,
-            "sources": [
-                { "type": "dir", "path": pack_dir, "dest": "pack" },
-                { "type": "dir", "path": files },
-            ],
-        }],
-    });
-    let manifest_path = staging.join(format!("{id}.json"));
-    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
-
-    // Lets `flatpak-builder` install the runtime. Does nothing if Flathub was already added.
+    // Lets `flatpak` install the runtime. Does nothing if Flathub was already added.
     run(Command::new("flatpak").args([
         "remote-add",
         "--user",
@@ -164,25 +109,83 @@ pub(super) fn create(
         "flathub",
         FLATHUB_REPO,
     ]))?;
-    let repo = staging.join("flatpak-repo");
-    run(Command::new("flatpak-builder")
-        .args([
-            "--user",
-            "--install-deps-from=flathub",
-            "--force-clean",
-            // Needs FUSE, which e.g. containers often lack, and only speeds up large builds.
-            "--disable-rofiles-fuse",
-            // The cache would hold another copy of the environment, which can be many GB.
-            "--disable-cache",
-        ])
+    run(Command::new("flatpak")
+        .args(["install", "--user", "--noninteractive", "--or-update"])
         .arg(format!("--arch={arch}"))
-        .arg(format!("--default-branch={BRANCH}"))
-        .arg("--state-dir")
-        .arg(staging.join("flatpak-builder"))
-        .arg("--repo")
+        .arg("flathub")
+        .arg(format!("{}//{}", config.runtime, config.runtime_version)))?;
+
+    let build_dir = staging.join("flatpak-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir)?;
+    }
+    // Nothing is compiled, the runtime has everything unpacking needs and is used as SDK.
+    run(Command::new("flatpak")
+        .arg("build-init")
+        .arg(format!("--arch={arch}"))
+        .arg(&build_dir)
+        .arg(&id)
+        .arg(&config.runtime)
+        .arg(&config.runtime)
+        .arg(&config.runtime_version))?;
+
+    // `files` is mounted at /app. Unpacking extracts the packages next to the pack, so with the
+    // pack there the environment hardlinks the extracted files instead of copying them.
+    let files = build_dir.join("files");
+    let (pack, unpack) = (files.join(".pack"), files.join(".pixi-unpack"));
+    std::fs::rename(pack_dir, &pack).context("could not move the pack into the Flatpak build")?;
+    write_file(&unpack, pixi_unpack, 0o755)?;
+    let mut unpack_command = Command::new("flatpak");
+    unpack_command.arg("build").arg("--die-with-parent");
+    // Packages left out of the pack are downloaded while building.
+    if pack.join(REMOTE_PACKAGES_PATH).exists() {
+        unpack_command.arg("--share=network");
+    }
+    run(unpack_command.arg(&build_dir).args([
+        "/app/.pixi-unpack",
+        "--output-directory",
+        "/app",
+        "--env-name",
+        "env",
+        "/app/.pack",
+    ]))?;
+    std::fs::remove_dir_all(&pack)?;
+    std::fs::remove_file(&unpack)?;
+
+    write_file(
+        &files.join("bin").join(&command_name),
+        launch_script(&app.command).as_bytes(),
+        0o755,
+    )?;
+    write_file(
+        &files.join(format!("share/applications/{id}.desktop")),
+        desktop_entry(app, &id, &command_name, app.icon_png().is_some()).as_bytes(),
+        0o644,
+    )?;
+    if let Some(icon) = app.icon_png() {
+        let icons = files.join("share/icons/hicolor");
+        std::fs::create_dir_all(&icons)?;
+        let png = icons.join("icon.png");
+        let size = prepare_icon(icon, &png)?;
+        let apps = icons.join(format!("{size}x{size}/apps"));
+        std::fs::create_dir_all(&apps)?;
+        std::fs::rename(&png, apps.join(format!("{id}.png")))?;
+    }
+
+    run(Command::new("flatpak")
+        .arg("build-finish")
+        .arg(format!("--command={command_name}"))
+        .args(&config.finish_args)
+        .arg(&build_dir))?;
+    let repo = staging.join("flatpak-repo");
+    run(Command::new("flatpak")
+        .arg("build-export")
+        .arg(format!("--arch={arch}"))
         .arg(&repo)
-        .arg(staging.join("flatpak-build"))
-        .arg(&manifest_path))?;
+        .arg(&build_dir)
+        .arg(BRANCH))?;
+    // The repo has a compressed copy now, the bundle is created from it.
+    std::fs::remove_dir_all(&build_dir)?;
 
     std::fs::create_dir_all(out_dir)?;
     let bundle = out_dir.join(format!("{command_name}_{}_{arch}.flatpak", app.version));
@@ -195,6 +198,21 @@ pub(super) fn create(
         .arg(&id)
         .arg(BRANCH))?;
     Ok(bundle)
+}
+
+fn write_file(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
 }
 
 fn run(command: &mut Command) -> Result<()> {
