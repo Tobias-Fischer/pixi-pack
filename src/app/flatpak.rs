@@ -2,7 +2,9 @@
 //!
 //! Flatpak applications always live at `/app` inside the sandbox, so unlike the other formats the
 //! environment is unpacked at build time, by running `pixi-unpack` inside the build sandbox. The
-//! application then starts the command directly from `/app/env`.
+//! application then starts the command directly from `/app/env`. If packages are downloaded when
+//! unpacking, the Flatpak instead contains `pixi-launcher`, which unpacks the environment into the
+//! application's data directory on first start, like on the other platforms.
 
 use std::{
     path::{Path, PathBuf},
@@ -14,7 +16,10 @@ use rattler_conda_types::Platform;
 use serde::Deserialize;
 
 use super::App;
-use crate::{REMOTE_PACKAGES_PATH, menu_placeholders, replace_placeholders};
+use super::PACK_FILE_NAME;
+use crate::{
+    LAUNCHER_CONFIG_FILE_NAME, REMOTE_PACKAGES_PATH, menu_placeholders, replace_placeholders,
+};
 
 const FLATHUB_REPO: &str = "https://dl.flathub.org/repo/flathub.flatpakrepo";
 const PREFIX: &str = "/app/env";
@@ -84,15 +89,29 @@ pub(super) fn check_host() -> Result<()> {
     Ok(())
 }
 
-/// Bundle the pack in `pack_dir` as a Flatpak in `out_dir`. The pack is moved into the build.
+/// What a Flatpak contains besides the application's desktop entry and icon.
+pub(super) enum FlatpakContents {
+    /// The environment, unpacked while building. The pack is moved into the build.
+    Environment {
+        pack_dir: PathBuf,
+        pixi_unpack: Vec<u8>,
+    },
+    /// `pixi-launcher`, which unpacks the pack on first start.
+    Launcher {
+        pixi_launcher: Vec<u8>,
+        pack_file: PathBuf,
+        launcher_config: PathBuf,
+    },
+}
+
+/// Create a Flatpak in `out_dir`.
 ///
 /// This uses the `flatpak build-*` commands rather than `flatpak-builder`, as `flatpak-builder`
 /// always commits the build to its cache, another uncompressed copy of the environment.
 pub(super) fn create(
     app: &App,
     config: &AppFlatpakConfig,
-    pack_dir: &Path,
-    pixi_unpack: &[u8],
+    contents: FlatpakContents,
     platform: Platform,
     staging: &Path,
     out_dir: &Path,
@@ -129,34 +148,52 @@ pub(super) fn create(
         .arg(&config.runtime)
         .arg(&config.runtime_version))?;
 
-    // `files` is mounted at /app. Unpacking extracts the packages next to the pack, so with the
-    // pack there the environment hardlinks the extracted files instead of copying them.
+    // `files` is mounted at /app.
     let files = build_dir.join("files");
-    let (pack, unpack) = (files.join(".pack"), files.join(".pixi-unpack"));
-    std::fs::rename(pack_dir, &pack).context("could not move the pack into the Flatpak build")?;
-    write_file(&unpack, pixi_unpack, 0o755)?;
-    let mut unpack_command = Command::new("flatpak");
-    unpack_command.arg("build").arg("--die-with-parent");
-    // Packages left out of the pack are downloaded while building.
-    if pack.join(REMOTE_PACKAGES_PATH).exists() {
-        unpack_command.arg("--share=network");
+    let command = files.join("bin").join(&command_name);
+    match contents {
+        FlatpakContents::Environment {
+            pack_dir,
+            pixi_unpack,
+        } => {
+            // Unpacking extracts the packages next to the pack, so with the pack in /app the
+            // environment hardlinks the extracted files instead of copying them.
+            let (pack, unpack) = (files.join(".pack"), files.join(".pixi-unpack"));
+            std::fs::rename(&pack_dir, &pack)
+                .context("could not move the pack into the Flatpak build")?;
+            write_file(&unpack, &pixi_unpack, 0o755)?;
+            let mut unpack_command = Command::new("flatpak");
+            unpack_command.arg("build").arg("--die-with-parent");
+            // Packages left out of the pack are downloaded while building.
+            if pack.join(REMOTE_PACKAGES_PATH).exists() {
+                unpack_command.arg("--share=network");
+            }
+            run(unpack_command.arg(&build_dir).args([
+                "/app/.pixi-unpack",
+                "--output-directory",
+                "/app",
+                "--env-name",
+                "env",
+                "/app/.pack",
+            ]))?;
+            std::fs::remove_dir_all(&pack)?;
+            std::fs::remove_file(&unpack)?;
+            write_file(&command, launch_script(&app.command).as_bytes(), 0o755)?;
+        }
+        FlatpakContents::Launcher {
+            pixi_launcher,
+            pack_file,
+            launcher_config,
+        } => {
+            // See `find_bundled_launcher_config`.
+            let resources = files.join("share/pixi-launcher");
+            std::fs::create_dir_all(&resources)?;
+            std::fs::copy(&launcher_config, resources.join(LAUNCHER_CONFIG_FILE_NAME))?;
+            std::fs::copy(&pack_file, resources.join(PACK_FILE_NAME))?;
+            write_file(&command, &pixi_launcher, 0o755)?;
+        }
     }
-    run(unpack_command.arg(&build_dir).args([
-        "/app/.pixi-unpack",
-        "--output-directory",
-        "/app",
-        "--env-name",
-        "env",
-        "/app/.pack",
-    ]))?;
-    std::fs::remove_dir_all(&pack)?;
-    std::fs::remove_file(&unpack)?;
 
-    write_file(
-        &files.join("bin").join(&command_name),
-        launch_script(&app.command).as_bytes(),
-        0o755,
-    )?;
     write_file(
         &files.join(format!("share/applications/{id}.desktop")),
         desktop_entry(app, &id, &command_name, app.icon_png().is_some()).as_bytes(),

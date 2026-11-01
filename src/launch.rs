@@ -20,7 +20,7 @@ use rattler_shell::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{UnpackOptions, UnpackProgress, unpack};
+use crate::{UnpackOptions, UnpackProgress, unarchive, unpack};
 
 /// File name of the launcher config inside an application bundle.
 pub const LAUNCHER_CONFIG_FILE_NAME: &str = "pixi-launcher.json";
@@ -75,12 +75,16 @@ impl LauncherConfig {
 ///
 /// - macOS: the executable is in `Foo.app/Contents/MacOS`, resources in `Foo.app/Contents/Resources`
 /// - Windows: resources are next to the executable
+/// - Flatpak: the executable is in `/app/bin`, resources in `/app/share/pixi-launcher`
 pub fn find_bundled_launcher_config() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
     [
         exe_dir.join("../Resources").join(LAUNCHER_CONFIG_FILE_NAME),
         exe_dir.join(LAUNCHER_CONFIG_FILE_NAME),
+        exe_dir
+            .join("../share/pixi-launcher")
+            .join(LAUNCHER_CONFIG_FILE_NAME),
     ]
     .into_iter()
     .find(|p| p.is_file())
@@ -158,14 +162,21 @@ async fn ensure_installed(
         .join(&config.pack_file);
     let progress = Arc::new(UnpackProgress::default());
     let _progress = ui::platform_ui().installing(&config.name, progress.clone());
+    // Extracted next to the install instead of into the temporary directory, which can be a small
+    // tmpfs (e.g. in a Flatpak) or on another file system, where the environment could not
+    // hardlink the packages. Removed with old installs if the launcher is interrupted.
+    let work_dir = tempfile::tempdir_in(&app_data_dir)?;
+    unarchive(&pack_file, work_dir.path())
+        .with_context(|| format!("could not extract {}", pack_file.display()))?;
     unpack(UnpackOptions {
-        pack_file,
+        pack_file: work_dir.path().to_path_buf(),
         output_directory: install_dir.to_path_buf(),
         env_name: ENV_NAME.to_string(),
         shell: None,
         progress: Some(progress),
     })
     .await?;
+    drop(work_dir);
     std::fs::write(&marker, &config.version)?;
 
     remove_old_installs(&app_data_dir, install_dir);
@@ -583,7 +594,6 @@ mod ui {
             Self(None)
         }
 
-        #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
         fn hide_with(hide: impl FnOnce() + 'static) -> Self {
             Self(Some(Box::new(hide)))
         }
@@ -607,7 +617,6 @@ mod ui {
     const NO_UI_ENV: &str = "PIXI_LAUNCHER_NO_UI";
 
     /// How often a progress window is updated.
-    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     const UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
     fn setup_text(name: &str) -> String {
@@ -615,7 +624,6 @@ mod ui {
     }
 
     /// The fraction done and a status line, `None` while the total is not known yet.
-    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     fn status(progress: &UnpackProgress) -> Option<(f64, String)> {
         let (done, total) = progress.get();
         if total == 0 {
@@ -637,7 +645,7 @@ mod ui {
         #[cfg(windows)]
         return Box::new(windows::WindowsUi);
         #[cfg(not(any(target_os = "macos", windows)))]
-        return Box::new(LogUi);
+        return Box::new(zenity::ZenityUi);
     }
 
     struct LogUi;
@@ -653,7 +661,6 @@ mod ui {
 
     /// Creates a window with `show` on a new thread and runs `update` on it every
     /// [`UPDATE_INTERVAL`] until the returned [`Progress`] is dropped, then runs `hide`.
-    #[cfg(any(target_os = "macos", windows))]
     fn poll<W>(
         show: impl FnOnce() -> W + Send + 'static,
         mut update: impl FnMut(&mut W) + Send + 'static,
@@ -763,6 +770,73 @@ mod ui {
                         title.as_ptr(),
                         MB_OK | MB_ICONERROR,
                     );
+                }
+            }
+        }
+    }
+
+    /// Dialogs with `zenity`, which e.g. the Freedesktop and GNOME Flatpak runtimes include.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    mod zenity {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+            sync::Arc,
+        };
+
+        use super::{LaunchUi, LogUi, Progress, poll, setup_text, status};
+        use crate::UnpackProgress;
+
+        pub struct ZenityUi;
+
+        impl LaunchUi for ZenityUi {
+            fn installing(&self, name: &str, progress: Arc<UnpackProgress>) -> Progress {
+                // Reads the percentage and `# text` lines from stdin.
+                let child = Command::new("zenity")
+                    .args(["--progress", "--no-cancel", "--width=420"])
+                    .arg(format!("--title={name}"))
+                    .arg(format!("--text={}", setup_text(name)))
+                    .stdin(Stdio::piped())
+                    .spawn();
+                let mut child = match child {
+                    Ok(child) => child,
+                    Err(e) => {
+                        tracing::warn!("could not show progress: {e}");
+                        return LogUi.installing(name, progress);
+                    }
+                };
+                let text = setup_text(name);
+                // Pulses until the total is known.
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = writeln!(stdin, "pulsate:true");
+                }
+                poll(
+                    move || child,
+                    move |child| {
+                        if let (Some(stdin), Some((fraction, line))) =
+                            (child.stdin.as_mut(), status(&progress))
+                        {
+                            // 100 would close the dialog, it is closed when done.
+                            let percent = (fraction * 100.0).min(99.0) as u32;
+                            let _ =
+                                writeln!(stdin, "pulsate:false\n{percent}\n# {text}\\n\\n{line}");
+                        }
+                    },
+                    |mut child| {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    },
+                )
+            }
+
+            fn error(&self, name: &str, message: &str) {
+                let status = Command::new("zenity")
+                    .args(["--error", "--no-markup", "--width=420"])
+                    .arg(format!("--title={name} could not be started"))
+                    .arg(format!("--text={message}"))
+                    .status();
+                if !status.is_ok_and(|s| s.success()) {
+                    LogUi.error(name, message);
                 }
             }
         }

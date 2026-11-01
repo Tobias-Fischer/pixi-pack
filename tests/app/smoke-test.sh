@@ -32,7 +32,10 @@ fi
 cleanup() {
   rm -f examples/app/smoke-test.toml
   if [ -n "${mount:-}" ]; then hdiutil detach "$mount" >/dev/null || true; fi
-  if [ -n "${flatpak:-}" ]; then flatpak uninstall --user --noninteractive "$identifier" || true; fi
+  if [ -n "${flatpak:-}" ]; then
+    flatpak uninstall --user --noninteractive "$identifier" || true
+    rm -rf "$HOME/.var/app/$identifier"
+  fi
   if [ -n "${uninstaller:-}" ]; then MSYS2_ARG_CONV_EXCL='*' "$uninstaller" /S || true; fi
   if [ -n "${data_dir:-}" ]; then rm -rf "$data_dir"; fi
   if [ "$(uname -s)" = Linux ]; then rm -rf "$work"; fi
@@ -55,8 +58,13 @@ Darwin)
   run() { "$mount/IDLE Demo.app/Contents/MacOS/IDLE Demo" "$marker"; }
   ;;
 Linux)
-  # The environment is unpacked while building the Flatpak, there is no launcher.
-  data_dir=""
+  if [ "${DOWNLOAD_PACKAGES:-}" = 1 ]; then
+    # The launcher unpacks the environment into the Flatpak's data directory.
+    data_dir="$HOME/.var/app/$identifier/data/$identifier"
+  else
+    # The environment is unpacked while building the Flatpak, there is no launcher.
+    data_dir=""
+  fi
   flatpak=("$work"/out/*.flatpak)
   flatpak install --user --noninteractive "${flatpak[0]}"
   run() { flatpak run "$identifier" "$marker"; }

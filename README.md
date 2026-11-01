@@ -258,17 +258,17 @@ finish-args = ["--share=ipc", "--share=network", "--socket=x11", "--socket=wayla
 pixi-pack --create-app app.toml --platform osx-arm64
 ```
 
-On macOS and Windows, the application contains `pixi-launcher`, the pack and a small launcher config.
-On first launch, the environment is unpacked into the user's data directory (`~/Library/Application Support/<identifier>` or `%LOCALAPPDATA%\<identifier>`); later launches start the entry point right away.
+On macOS and Windows, and for Flatpaks with `download-packages`, the application contains `pixi-launcher`, the pack and a small launcher config.
+On first launch, the environment is unpacked into the user's data directory (`~/Library/Application Support/<identifier>`, `%LOCALAPPDATA%\<identifier>` or `~/.var/app/<flatpak id>/data/<identifier>`); later launches start the entry point right away.
 When a new version of the application is opened, its environment replaces the old one.
 The Windows uninstaller offers to remove the unpacked environment.
-A window shows the progress of the first launch.
+A window shows the progress of the first launch (with `zenity` on Linux, which the Flatpak runtime includes).
 
 With `download-packages = true`, the application only contains the packages' metadata, and the first launch downloads them from their channels, checking their SHA256.
-This keeps the application small, e.g. for environments with CUDA, whose Windows installers would exceed the 2 GB limit of NSIS.
+This keeps the application small and quick to build, e.g. for environments with CUDA, whose Windows installers would exceed the 2 GB limit of NSIS.
 The first launch then needs internet access, and the channels must be public and still serve the packages.
 Packages without an `http(s)` URL, e.g. from a local channel, are still included.
-For Flatpaks, the packages are downloaded while building instead, which needs less disk space.
+Flatpaks need the network permission for this, which they have by default.
 
 On macOS, the application is signed with `codesign` with `signing-identity`, or ad-hoc without it (see [below](#applications-without-signing)).
 It is notarized if `APPLE_KEYCHAIN_PROFILE`, or `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID`, or `APPLE_API_KEY`, `APPLE_API_ISSUER` and `APPLE_API_KEY_PATH` are set.
@@ -277,14 +277,14 @@ On Windows, the launcher gets the application's icon (an `.ico`, or one created 
 The launcher, the installer and the uninstaller are signed if `certificate-thumbprint` (with `signtool`, only on Windows) or `sign-command` (on any platform, e.g. with `osslsigncode` or a cloud signing service) is set.
 The sign command is split on spaces, use a script for commands with spaces in paths.
 
-On Linux, `pixi-unpack` unpacks the environment into the Flatpak in the Flatpak build sandbox, as Flatpaks are always installed at the same path.
+On Linux, `pixi-unpack` unpacks the environment into the Flatpak in the Flatpak build sandbox, as Flatpaks are always installed at the same path, unless `download-packages` is set.
 The Flatpak runs on the [Freedesktop runtime](https://flathub.org/apps/org.freedesktop.Platform), which users install along with the application.
 For the build, `pixi-pack` adds [Flathub](https://flathub.org) as a remote of the user's Flatpak installation if missing, and installs the runtime from it.
 The sandbox permissions (`finish-args`) let the application open windows, use the GPU and the network, and read and write files in the home directory, as conda GUI toolkits often don't use the file chooser portal.
 The identifier becomes the Flatpak application id, with `-` replaced by `_` in all but its last part.
 Users install the `.flatpak` by opening it in their software center, or with `flatpak install --user app.flatpak`.
 Flatpak is preinstalled on e.g. Fedora and Linux Mint, other distributions [need to install it](https://flathub.org/setup) once.
-Building needs the size of the unpacked environment plus its compressed copy as free space in the temporary directory (`TMPDIR`), plus the packages unless `download-packages` is set.
+Without `download-packages`, building needs the size of the unpacked environment plus its compressed copy, plus the packages, as free space in the temporary directory (`TMPDIR`).
 On GitHub-hosted runners, large environments need [more free space](https://github.com/actions/runner-images/issues/2840).
 
 `pixi-launcher` and `pixi-unpack` are downloaded from the pixi-pack release, use `--pixi-launcher-source` and `--pixi-unpack-source` to provide different ones.

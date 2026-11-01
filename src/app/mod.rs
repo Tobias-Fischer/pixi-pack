@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use self::flatpak::AppFlatpakConfig;
 use crate::{
-    LAUNCHER_CONFIG_FILE_NAME, LauncherConfig, PackOptions,
+    LAUNCHER_CONFIG_FILE_NAME, LauncherConfig, PackOptions, REMOTE_PACKAGES_PATH,
     pack::{create_tarball, download_release_executable},
     resolve_platform,
 };
@@ -62,10 +62,10 @@ pub struct AppConfig {
     /// default is `dmg` on macOS, `nsis` on Windows and `flatpak` on Linux.
     #[serde(default)]
     pub formats: Vec<AppFormat>,
-    /// Download conda packages from their channels when unpacking instead of including them in
-    /// the pack: on first launch on macOS and Windows, which keeps the installer small, and while
-    /// building Flatpaks, which needs less disk space. Packages without an `http(s)` URL are
-    /// still included.
+    /// Download conda packages from their channels on first launch instead of including them in
+    /// the application, which keeps it small. Packages without an `http(s)` URL are still
+    /// included. Flatpaks then contain `pixi-launcher` and unpack the environment into the
+    /// application's data directory, like on the other platforms.
     #[serde(default)]
     pub download_packages: bool,
     #[serde(default)]
@@ -365,21 +365,41 @@ pub async fn create_app(
 
     eprintln!("📦 Creating application for {}", app.name);
     let paths = if formats.contains(&AppFormat::Flatpak) {
-        let pixi_unpack =
-            download_release_executable("pixi-unpack", pixi_unpack_source, platform).await?;
+        let contents = if pack_dir.join(REMOTE_PACKAGES_PATH).exists() {
+            // Like on the other platforms, the launcher downloads the packages on first start.
+            let pack_file = staging.join(PACK_FILE_NAME);
+            create_tarball(&pack_dir, &pack_file)?;
+            let launcher_config = staging.join(LAUNCHER_CONFIG_FILE_NAME);
+            write_launcher_config(&app, &pack_file, &launcher_config)?;
+            flatpak::FlatpakContents::Launcher {
+                pixi_launcher: download_release_executable(
+                    "pixi-launcher",
+                    launcher_source,
+                    platform,
+                )
+                .await?,
+                pack_file,
+                launcher_config,
+            }
+        } else {
+            flatpak::FlatpakContents::Environment {
+                pack_dir: pack_dir.clone(),
+                pixi_unpack: download_release_executable(
+                    "pixi-unpack",
+                    pixi_unpack_source,
+                    platform,
+                )
+                .await?,
+            }
+        };
         let flatpak = tokio::task::spawn_blocking({
-            let (app, pack_dir, staging, out_dir) = (
-                app.clone(),
-                pack_dir.clone(),
-                staging.to_path_buf(),
-                out_dir.to_path_buf(),
-            );
+            let (app, staging, out_dir) =
+                (app.clone(), staging.to_path_buf(), out_dir.to_path_buf());
             move || {
                 flatpak::create(
                     &app,
                     &config.flatpak,
-                    &pack_dir,
-                    &pixi_unpack,
+                    contents,
                     platform,
                     &staging,
                     &out_dir,
